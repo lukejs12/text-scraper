@@ -212,6 +212,39 @@
     margin-right: 6px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .settings-panel {
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .field-label {
+    font-size: 0.72rem;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .settings-panel input[type="url"],
+  .settings-panel input[type="text"] {
+    background: #1a1a2e;
+    border: 1px solid #3a3a5c;
+    color: var(--text);
+    padding: 9px 10px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    outline: none;
+    width: 100%;
+  }
+  .settings-panel .copy-btn {
+    align-self: flex-start;
+    margin-top: 4px;
+  }
+  .save-note {
+    font-size: 0.72rem;
+    color: #7fd4c8;
+  }
 </style>
 </head>
 <body>
@@ -227,13 +260,22 @@
   </div>
 
   <label class="options">
-    <input type="checkbox" id="proxyToggle" checked />
-    Use CORS proxy (needed for most sites)
+    <input type="checkbox" id="serverToggle" checked />
+    Use render server (handles CORS + JavaScript-heavy pages)
   </label>
   <label class="options">
     <input type="checkbox" id="imagesToggle" checked />
     Include images
   </label>
+
+  <div class="settings-panel" id="settingsPanel">
+    <label class="field-label" for="serverUrlInput">Render server URL</label>
+    <input type="url" id="serverUrlInput" placeholder="https://your-app-name.onrender.com" autocapitalize="off" autocorrect="off" spellcheck="false" />
+    <label class="field-label" for="apiKeyInput">API key (if you set one)</label>
+    <input type="text" id="apiKeyInput" placeholder="optional" autocapitalize="off" autocorrect="off" spellcheck="false" />
+    <button class="copy-btn" id="saveSettingsBtn">Save</button>
+    <span class="save-note" id="saveNote"></span>
+  </div>
 
   <div class="status" id="status"></div>
 
@@ -245,13 +287,15 @@
   <div class="results" id="results"></div>
 
   <footer>
-    Runs entirely in your browser. Direct fetches fail on most sites due to
-    CORS restrictions, so this app can route the request through a public
-    proxy, trying a couple of fallbacks if the first is unavailable. Turn
-    the proxy off if the target site allows cross-origin requests directly.
-    Images are loaded straight from their original source URLs, so slow or
-    hotlink-protected sites may show broken thumbnails even when the link
-    itself is valid.
+    Runs entirely in your browser, plus one server you control. With the
+    render server on, requests go to the server you deployed (see its
+    README for setup) — it loads the page in real headless Chrome, waits
+    for JavaScript to finish, and hands back the final HTML, sidestepping
+    both CORS and JS-only content. With it off, this app fetches the URL
+    directly from your phone's browser, which only works on sites that
+    explicitly allow cross-origin requests. Images are loaded from their
+    original source URLs, so slow or hotlink-protected sites may show
+    broken thumbnails even when the link itself is valid.
   </footer>
 </div>
 
@@ -263,18 +307,38 @@ const resultsEl = document.getElementById('results');
 const countBar = document.getElementById('countBar');
 const countText = document.getElementById('countText');
 const copyBtn = document.getElementById('copyBtn');
-const proxyToggle = document.getElementById('proxyToggle');
+const serverToggle = document.getElementById('serverToggle');
 const imagesToggle = document.getElementById('imagesToggle');
+const settingsPanel = document.getElementById('settingsPanel');
+const serverUrlInput = document.getElementById('serverUrlInput');
+const apiKeyInput = document.getElementById('apiKeyInput');
+const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+const saveNote = document.getElementById('saveNote');
 
 let lastParagraphs = [];
 
-// Tried in order if proxying is enabled. Each entry returns a URL that
-// resolves to the raw HTML body of targetUrl. Add your own proxy here
-// if you run one.
-const PROXIES = [
-  targetUrl => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(targetUrl),
-  targetUrl => 'https://corsproxy.io/?url=' + encodeURIComponent(targetUrl)
-];
+// Settings persist per-device via localStorage — never sent anywhere
+// except to the server URL you configure below.
+function loadSettings() {
+  try {
+    serverUrlInput.value = localStorage.getItem('renderServerUrl') || '';
+    apiKeyInput.value = localStorage.getItem('renderServerApiKey') || '';
+  } catch {
+    // localStorage unavailable (e.g. private browsing) — settings just won't persist.
+  }
+}
+function saveSettings() {
+  try {
+    localStorage.setItem('renderServerUrl', serverUrlInput.value.trim());
+    localStorage.setItem('renderServerApiKey', apiKeyInput.value.trim());
+    saveNote.textContent = 'Saved.';
+    setTimeout(() => (saveNote.textContent = ''), 1500);
+  } catch {
+    saveNote.textContent = 'Could not save (storage unavailable).';
+  }
+}
+loadSettings();
+saveSettingsBtn.addEventListener('click', saveSettings);
 
 function setStatus(msg, isError) {
   statusEl.textContent = msg;
@@ -289,33 +353,38 @@ function normalizeUrl(raw) {
   return u;
 }
 
-async function fetchHtml(targetUrl, useProxy) {
-  if (!useProxy) {
+async function fetchHtml(targetUrl, useServer) {
+  if (!useServer) {
     const res = await fetch(targetUrl, { redirect: 'follow' });
     if (!res.ok) throw new Error('Direct request failed with status ' + res.status);
     return await res.text();
   }
 
-  const errors = [];
-  for (const buildUrl of PROXIES) {
-    const fetchUrl = buildUrl(targetUrl);
-    try {
-      const res = await fetch(fetchUrl, { redirect: 'follow' });
-      if (!res.ok) {
-        errors.push(fetchUrl + ' -> HTTP ' + res.status);
-        continue;
-      }
-      const text = await res.text();
-      if (!text || text.trim().length === 0) {
-        errors.push(fetchUrl + ' -> empty response');
-        continue;
-      }
-      return text;
-    } catch (err) {
-      errors.push(fetchUrl + ' -> ' + err.message);
-    }
+  const serverUrl = serverUrlInput.value.trim();
+  if (!serverUrl) {
+    throw new Error('No render server URL configured — enter one in the settings panel above.');
   }
-  throw new Error('All proxies failed: ' + errors.join(' | '));
+  const apiKey = apiKeyInput.value.trim();
+  const renderEndpoint = serverUrl.replace(/\/$/, '') + '/render?url=' + encodeURIComponent(targetUrl);
+
+  const headers = {};
+  if (apiKey) headers['x-api-key'] = apiKey;
+
+  let res;
+  try {
+    res = await fetch(renderEndpoint, { headers });
+  } catch (err) {
+    throw new Error('Could not reach render server (' + err.message + '). If it\'s been idle, it may be waking up — try again in ~30s.');
+  }
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = body.error ? ': ' + body.error : '';
+    } catch {}
+    throw new Error('Render server returned HTTP ' + res.status + detail);
+  }
+  return await res.text();
 }
 
 function extractParagraphs(html) {
@@ -469,7 +538,7 @@ async function handleFetch() {
   statusEl.innerHTML = '<span class="spinner"></span>Fetching…';
 
   try {
-    const html = await fetchHtml(targetUrl, proxyToggle.checked);
+    const html = await fetchHtml(targetUrl, serverToggle.checked);
     const paragraphs = extractParagraphs(html);
     const links = extractLinks(html, targetUrl);
     const includeImages = imagesToggle.checked;
@@ -479,8 +548,8 @@ async function handleFetch() {
   } catch (err) {
     console.error(err);
     let msg = 'Failed to fetch that page. ';
-    if (!proxyToggle.checked) {
-      msg += 'This is often a CORS restriction — try enabling the proxy toggle above.';
+    if (!serverToggle.checked) {
+      msg += 'This is often a CORS restriction — try enabling the render server toggle above.';
     } else {
       msg += 'Details: ' + err.message;
     }
